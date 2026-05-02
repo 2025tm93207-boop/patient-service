@@ -1,12 +1,11 @@
 import os
-import csv
 import time
 import logging
-from datetime import datetime, date
+from datetime import date, datetime
 
 from flask import Flask, request, jsonify, g
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import text, event
+from sqlalchemy import event
 from pythonjsonlogger import jsonlogger
 from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
 
@@ -169,10 +168,18 @@ def swagger_json():
                     'responses': {'200': {'description': 'Updated'}, '404': {'description': 'Not found'}}
                 },
                 'delete': {
-                    'summary': 'Delete patient',
+                    'summary': 'Deactivate patient (soft-delete)',
                     'parameters': [{'name': 'patient_id', 'in': 'path', 'required': True,
                                     'schema': {'type': 'integer'}}],
-                    'responses': {'200': {'description': 'Deleted'}, '404': {'description': 'Not found'}}
+                    'responses': {'200': {'description': 'Deactivated'}, '404': {'description': 'Not found'}}
+                }
+            },
+            '/patients/{patient_id}/activate': {
+                'patch': {
+                    'summary': 'Reactivate a deactivated patient',
+                    'parameters': [{'name': 'patient_id', 'in': 'path', 'required': True,
+                                    'schema': {'type': 'integer'}}],
+                    'responses': {'200': {'description': 'Activated'}, '404': {'description': 'Not found'}}
                 }
             }
         }
@@ -193,6 +200,8 @@ def create_patient():
 
     if Patient.query.filter_by(email=data['email']).first():
         return jsonify({'error': 'Email already registered'}), 409
+    if data.get('id') and db.session.get(Patient, int(data['id'])):
+        return jsonify({'error': 'Patient already exists'}), 409
 
     dob = None
     if data.get('dob'):
@@ -201,8 +210,12 @@ def create_patient():
         except ValueError:
             return jsonify({'error': 'Invalid dob format, expected YYYY-MM-DD'}), 400
 
-    patient = Patient(name=data['name'], email=data['email'],
-                      phone=str(data['phone']), dob=dob)
+    patient = Patient(
+        id=int(data['id']) if data.get('id') else None,
+        name=data['name'], email=data['email'],
+        phone=str(data['phone']), dob=dob,
+        is_active=True,
+    )
     db.session.add(patient)
     db.session.commit()
     PATIENTS_CREATED.inc()
@@ -214,7 +227,12 @@ def create_patient():
 
 @app.route('/patients', methods=['GET'])
 def list_patients():
-    return jsonify([p.to_dict() for p in Patient.query.all()])
+    q = Patient.query
+    # Support ?active=true/false filter
+    active_param = request.args.get('active')
+    if active_param is not None:
+        q = q.filter_by(is_active=(active_param.lower() == 'true'))
+    return jsonify([p.to_dict() for p in q.all()])
 
 
 @app.route('/patients/<int:patient_id>', methods=['GET'])
@@ -247,57 +265,43 @@ def update_patient(patient_id):
         except ValueError:
             return jsonify({'error': 'Invalid dob format, expected YYYY-MM-DD'}), 400
 
+    patient.updated_at = datetime.utcnow()
     db.session.commit()
     return jsonify(patient.to_dict())
 
 
 @app.route('/patients/<int:patient_id>', methods=['DELETE'])
-def delete_patient(patient_id):
+def deactivate_patient(patient_id):
+    """Soft-delete: marks patient as inactive, preserving history."""
     patient = db.session.get(Patient, patient_id)
     if not patient:
         return jsonify({'error': 'Patient not found'}), 404
-    db.session.delete(patient)
+    if not patient.is_active:
+        return jsonify({'error': 'Patient is already inactive'}), 409
+    patient.is_active = False
+    patient.updated_at = datetime.utcnow()
     db.session.commit()
-    return jsonify({'message': f'Patient {patient_id} deleted'})
+    logger.info('patient_deactivated', extra={'patient_id': patient_id})
+    return jsonify({'message': f'Patient {patient_id} deactivated', **patient.to_dict()})
 
-# ── Seed ──────────────────────────────────────────────────────────────────────
-def seed_data():
-    if Patient.query.count() > 0:
-        return
-    csv_dir = os.environ.get(
-        'CSV_DIR',
-        os.path.join(os.path.dirname(__file__), '..', '..', 'doc', 'HMS Dataset (1)')
-    )
-    csv_path = os.path.join(csv_dir, 'hms_patients_indian.csv')
-    if not os.path.exists(csv_path):
-        logger.warning('seed_skipped', extra={'reason': f'CSV not found: {csv_path}'})
-        return
-    with open(csv_path, newline='', encoding='utf-8') as f:
-        for row in csv.DictReader(f):
-            try:
-                dob_val = date.fromisoformat(row['dob']) if row.get('dob') else None
-            except ValueError:
-                dob_val = None
-            try:
-                created = datetime.fromisoformat(row['created_at'])
-            except (ValueError, KeyError):
-                created = datetime.utcnow()
-            db.session.execute(text(
-                "INSERT OR IGNORE INTO patients (id, name, email, phone, dob, created_at)"
-                " VALUES (:id, :name, :email, :phone, :dob, :created_at)"
-            ), {
-                'id': int(row['patient_id']), 'name': row['name'],
-                'email': row['email'], 'phone': row['phone'],
-                'dob': dob_val.isoformat() if dob_val else None,
-                'created_at': created.isoformat(),
-            })
+
+@app.route('/patients/<int:patient_id>/activate', methods=['PATCH'])
+def activate_patient(patient_id):
+    """Re-activate a previously deactivated patient."""
+    patient = db.session.get(Patient, patient_id)
+    if not patient:
+        return jsonify({'error': 'Patient not found'}), 404
+    if patient.is_active:
+        return jsonify({'error': 'Patient is already active'}), 409
+    patient.is_active = True
+    patient.updated_at = datetime.utcnow()
     db.session.commit()
-    logger.info('seed_complete', extra={'table': 'patients'})
+    logger.info('patient_activated', extra={'patient_id': patient_id})
+    return jsonify({'message': f'Patient {patient_id} activated', **patient.to_dict()})
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-        seed_data()
     port = int(os.environ.get('PORT', 5001))
     app.run(host='0.0.0.0', port=port, debug=False)
